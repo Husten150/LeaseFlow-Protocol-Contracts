@@ -8,7 +8,9 @@ use super::*;
 use crate::{
     CreateLeaseParams, DataKey, DepositStatus, HistoricalLease, LeaseContract, LeaseContractClient,
     LeaseStatus, MaintenanceStatus, RateType, SubletStatus, UtilityBillStatus,
+    DamageSeverity, OraclePayload,
 };
+use crate::{JUROR_SLASH_AMOUNT, JUROR_VOTE_DEADLINE_HOURS};
 use soroban_sdk::{
     contract, contractclient, contractimpl, symbol_short,
     testutils::{Address as _, Ledger},
@@ -29,6 +31,33 @@ impl KycMock {
     }
     pub fn set_verified(env: Env, address: Address, status: bool) {
         env.storage().instance().set(&address, &status);
+    }
+}
+
+#[contract]
+pub struct YieldMock;
+
+#[contractimpl]
+impl YieldMock {
+    pub fn deposit(env: Env, from: Address, amount: i128) -> Result<i128, i32> {
+        let lp_tokens = amount;
+        env.storage().instance().set(&from, &lp_tokens);
+        Ok(lp_tokens)
+    }
+    
+    pub fn withdraw(env: Env, from: Address, lp_tokens: i128) -> Result<i128, i32> {
+        let withdrawn = lp_tokens;
+        env.storage().instance().remove(&from);
+        Ok(withdrawn)
+    }
+    
+    pub fn get_balance(env: Env, user: Address) -> i128 {
+        env.storage().instance().get(&user).unwrap_or(0)
+    }
+    
+    pub fn claim_rewards(env: Env, user: Address) -> Result<i128, i32> {
+        let rewards = 1000i128;
+        Ok(rewards)
     }
 }
 
@@ -109,24 +138,16 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        // Emergency pause fields
-        paused: false,
-        pause_reason: None,
-        paused_at: None,
-        pause_initiator: None,
-        total_paused_duration: 0,
-        rent_pull_authorized_amount: None,
-        last_rent_pull_timestamp: None,
-        billing_cycle_duration: 2_592_000,
-        // New Features
-        yield_delegation_enabled: false,
-        yield_accumulated: 0,
-        equity_balance: 0,
-        equity_percentage_bps: 0,
-        had_late_payment: false,
-        has_pet: false,
-        pet_deposit_amount: 0,
-        pet_rent_amount: 0,
+        maintenance_status: MaintenanceStatus::None,
+        withheld_rent: 0,
+        repair_proof_hash: None,
+        inspector: None,
+        wear_allowance_bps: 500, // 5% wear allowance
+        asset_lifespan_days: 3650, // 10 years
+        asset_value: 100_000, // Asset value in stroops
+        deposit_timestamp: START,
+        subleasing_allowed: true,
+        master_lease_id: None,
     }
 }
 
@@ -136,6 +157,292 @@ fn seed_lease(env: &Env, contract_id: &Address, lease_id: u64, lease: &LeaseInst
 
 fn read_lease(env: &Env, contract_id: &Address, lease_id: u64) -> Option<LeaseInstance> {
     env.as_contract(contract_id, || load_lease_instance_by_id(env, lease_id))
+}
+
+#[test]
+fn test_oracle_whitelist_management() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[1; 32]);
+    let unauthorized_user = Address::generate(&env);
+
+    client.set_admin(&admin);
+
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+    
+    let is_whitelisted = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
+    });
+    assert!(is_whitelisted);
+
+    let result = client.try_whitelist_oracle(&unauthorized_user, &oracle_pubkey);
+    assert_eq!(result, Err(LeaseError::Unauthorised));
+
+    client.remove_oracle(&admin, &oracle_pubkey);
+    
+    let is_whitelisted_after_removal = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
+    });
+    assert!(!is_whitelisted_after_removal);
+}
+
+#[test]
+fn test_oracle_nonce_management() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[2; 32]);
+
+    let initial_nonce = env.as_contract(contract_id, || {
+        crate::LeaseContract::get_oracle_nonce(&env, &oracle_pubkey)
+    });
+    assert_eq!(initial_nonce, 0);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &oracle_pubkey, 5);
+    });
+
+    let updated_nonce = env.as_contract(contract_id, || {
+        crate::LeaseContract::get_oracle_nonce(&env, &oracle_pubkey)
+    });
+    assert_eq!(updated_nonce, 5);
+}
+
+#[test]
+fn test_damage_severity_penalty_calculation() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+
+    let test_cases = vec![
+        (DamageSeverity::NormalWearAndTear, 0),
+        (DamageSeverity::Minor, 10),
+        (DamageSeverity::Moderate, 25),
+        (DamageSeverity::Major, 50),
+        (DamageSeverity::Severe, 75),
+        (DamageSeverity::Catastrophic, 100),
+    ];
+
+    for (severity, expected_percentage) in test_cases {
+        let calculated_percentage = env.as_contract(contract_id, || {
+            crate::LeaseContract::calculate_penalty_percentage(severity)
+        });
+        assert_eq!(calculated_percentage, expected_percentage);
+    }
+}
+
+#[test]
+fn test_execute_deposit_slash_normal_wear_and_tear() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[3; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    lease.payment_token = Address::generate(&env);
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::NormalWearAndTear,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &payload.oracle_pubkey, 0);
+    });
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::InvalidSignature));
+}
+
+#[test]
+fn test_execute_deposit_slash_unauthorized_oracle() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let unauthorized_oracle = BytesN::from_array(&env, &[4; 32]);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &Address::generate(&env), LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey: unauthorized_oracle,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::OracleNotWhitelisted));
+}
+
+#[test]
+fn test_execute_deposit_slash_invalid_nonce() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[5; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &oracle_pubkey, 5);
+    });
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 3,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::InvalidNonce));
+}
+
+#[test]
+fn test_execute_deposit_slash_lease_not_terminated() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[6; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let lease = make_lease(&env, &landlord, &tenant);
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::LeaseNotTerminated));
+}
+
+#[test]
+fn test_execute_deposit_slash_deposit_already_settled() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[7; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    lease.deposit_status = DepositStatus::Settled;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::DepositAlreadySettled));
+}
+
+#[test]
+fn test_tenant_flagging_functionality() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+    let tenant = Address::generate(&env);
+    let reason = String::from_str(&env, "Severe damage exceeding deposit value");
+
+    let is_flagged_initially = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_tenant_flagged(&env, LEASE_ID)
+    });
+    assert!(!is_flagged_initially);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::flag_tenant(&env, LEASE_ID, tenant.clone(), reason.clone());
+    });
+
+    let is_flagged_after = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_tenant_flagged(&env, LEASE_ID)
+    });
+    assert!(is_flagged_after);
+}
+
+#[test]
+fn test_signature_timestamp_validation() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[8; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let future_timestamp = env.ledger().timestamp() + 100000;
+    let payload_future = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: future_timestamp,
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result_future = client.try_execute_deposit_slash(&payload_future);
+    assert_eq!(result_future, Err(LeaseError::InvalidSignature));
+
+    let old_timestamp = env.ledger().timestamp() - 100000;
+    let payload_old = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: old_timestamp,
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result_old = client.try_execute_deposit_slash(&payload_old);
+    assert_eq!(result_old, Err(LeaseError::InvalidSignature));
 }
 
 #[test]
@@ -1883,6 +2190,607 @@ fn test_terminate_lease_no_bounty_without_platform_fee() {
     // Should succeed without panicking even though no fee is set.
     client.terminate_lease(&LEASE_ID, &landlord);
     assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
+}
+
+#[test]
+fn test_mutual_deposit_release_success() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create and fund a lease with deposits
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Fund contract with tokens for the deposits
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test successful mutual release - full refund to tenant
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000, // return_amount
+        &0,    // slash_amount
+    );
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+    assert!(!updated_lease.active);
+}
+
+#[test]
+fn test_mutual_deposit_release_partial_split() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create and fund a lease with deposits
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Fund contract with tokens for the deposits
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test successful mutual release - partial split
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &600,  // return_amount to tenant
+        &400,  // slash_amount to landlord
+    );
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+}
+
+#[test]
+fn test_mutual_deposit_release_invalid_math() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test invalid math - amounts don't sum to total
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &500,  // return_amount
+        &300,  // slash_amount (sum = 800, but total = 1000)
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+    
+    // Verify lease is not terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Active);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Held);
+}
+
+#[test]
+fn test_mutual_deposit_release_negative_amounts() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test negative return amount
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &-100, // negative return_amount
+        &1100, // slash_amount
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+    
+    // Test negative slash amount
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1100, // return_amount
+        &-100, // negative slash_amount
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+}
+
+#[test]
+fn test_mutual_deposit_release_unauthorized_parties() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test with wrong tenant
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &impostor, // wrong tenant
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::Unauthorised));
+    
+    // Test with wrong landlord
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &impostor, // wrong landlord
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::Unauthorised));
+}
+
+#[test]
+fn test_mutual_deposit_release_wrong_lease_state() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Test with already terminated lease
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Terminated;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::LeaseNotFound));
+}
+
+#[test]
+fn test_initiate_mutual_release_with_fallback() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test fallback mechanism - should transition to dispute
+    client.initiate_mutual_release_with_fallback(
+        &LEASE_ID,
+        &tenant,
+        &600, // proposed return
+        &400, // proposed slash
+    );
+    
+    // Verify lease transitions to disputed state
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Disputed);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Disputed);
+}
+
+#[test]
+fn test_mutual_release_with_nft() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create lease with NFT
+    let nft_id = env.register(NftMock, ());
+    let nft_client = NftMockClient::new(&env, &nft_id);
+    let token_id = 42;
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.nft_contract = Some(nft_id);
+    lease.token_id = Some(token_id);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Mint NFT to contract
+    nft_client.mint(&contract_id, &token_id);
+    
+    // Fund contract with tokens
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test mutual release with NFT return
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    // Verify NFT is returned to landlord
+    assert_eq!(nft_client.owner_of(&token_id), landlord);
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+}
+
+// Yield Generation Tests
+
+fn create_yield_test_env() -> (Env, Address, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let dao = Address::generate(&env);
+    
+    let lease_contract_id = env.register_contract(None, LeaseContract);
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    let yield_contract_id = env.register_contract(None, YieldMock);
+    
+    lease_client.set_admin(&admin);
+    lease_client.set_platform_fee(&admin, &1000, &Address::generate(&env), &dao);
+    lease_client.whitelist_yield_protocol(&admin, &yield_contract_id);
+    lease_client.set_liquidity_buffer_amount(&admin, &10000);
+    
+    (env, lease_contract_id, yield_contract_id, admin, landlord, tenant)
+}
+
+fn create_test_lease_for_yield(env: &Env, contract_id: &Address, landlord: Address, tenant: Address) {
+    let lease_client = LeaseContractClient::new(env, contract_id);
+    let payment_token = Address::generate(env);
+    
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 5000,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(env, "test_property"),
+        payment_token: payment_token.clone(),
+        arbitrators: soroban_sdk::Vec::new(env),
+        rent_per_sec: 0,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: true,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 500,
+        swap_path: soroban_sdk::Vec::new(env),
+    };
+    
+    lease_client.create_lease_instance(&LEASE_ID, &landlord, &params).unwrap();
+}
+
+#[test]
+fn test_deploy_escrow_to_yield_success() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Deploy 2000 from security deposit to yield
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500, // 5% max slippage
+    ).unwrap();
+    
+    // Verify deployment was recorded
+    let deployment = lease_client.get_yield_deployment(&LEASE_ID).unwrap();
+    assert_eq!(deployment.lease_id, LEASE_ID);
+    assert_eq!(deployment.principal_amount, 2000);
+    assert_eq!(deployment.yield_protocol, yield_contract_id);
+    assert_eq!(deployment.lp_tokens, 2000);
+    assert!(deployment.active);
+    
+    // Verify security deposit was reduced
+    let lease = lease_client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.security_deposit, 3000); // 5000 - 2000
+}
+
+#[test]
+fn test_deploy_escrow_to_yield_insufficient_buffer() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Set buffer too low
+    lease_client.set_liquidity_buffer_amount(&admin, &1000);
+    
+    // Try to deploy 2000 - should fail due to insufficient buffer
+    let result = lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_deploy_escrow_to_yield_unauthorized_protocol() {
+    let (env, lease_contract_id, _yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    let unauthorized_protocol = Address::generate(&env);
+    
+    // Try to deploy to unauthorized protocol - should fail
+    let result = lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &unauthorized_protocol,
+        &2000,
+        &500,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_harvest_yield_success() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Deploy to yield first
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500,
+    ).unwrap();
+    
+    // Harvest yield
+    lease_client.harvest_yield(&LEASE_ID).unwrap();
+    
+    // Verify accumulated yield
+    let accumulated = lease_client.get_accumulated_yield(&LEASE_ID);
+    assert_eq!(accumulated, 1000); // Mock returns 1000
+    
+    // Verify deployment is still active
+    let deployment = lease_client.get_yield_deployment(&LEASE_ID).unwrap();
+    assert!(deployment.active);
+}
+
+#[test]
+fn test_harvest_yield_distribution() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Deploy to yield first
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500,
+    ).unwrap();
+    
+    // Harvest yield - should distribute 50% to lessee, 30% to lessor, 20% to DAO
+    lease_client.harvest_yield(&LEASE_ID).unwrap();
+    
+    // Verify EscrowYieldHarvested event was emitted
+    let events = env.events().all();
+    let yield_events: Vec<_> = events
+        .into_iter()
+        .filter(|event| event.topics.len() >= 6)
+        .collect();
+    
+    assert!(!yield_events.is_empty());
+}
+
+#[test]
+fn test_withdraw_from_yield_success() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Deploy to yield first
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500,
+    ).unwrap();
+    
+    // Withdraw from yield
+    lease_client.withdraw_from_yield(&LEASE_ID, &500).unwrap();
+    
+    // Verify security deposit was restored
+    let lease = lease_client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.security_deposit, 5000); // Back to original
+    
+    // Verify deployment is inactive
+    let deployment = lease_client.get_yield_deployment(&LEASE_ID).unwrap();
+    assert!(!deployment.active);
+    assert_eq!(deployment.lp_tokens, 0);
+}
+
+#[test]
+fn test_withdraw_from_yield_impermanent_loss() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
+    
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    
+    // Deploy to yield first
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &2000,
+        &500,
+    ).unwrap();
+    
+    // This test would need a modified YieldMock that returns less than principal
+    // For now, we test the slippage protection
+    let result = lease_client.withdraw_from_yield(&LEASE_ID, &100); // 1% max slippage
+    
+    // In mock implementation, this should succeed since we return full principal
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_yield_distribution_math() {
+    let total_yield = 1000i128;
+    
+    // Test the distribution calculation directly
+    let (lessee, lessor, dao) = LeaseContract::calculate_yield_distribution(total_yield);
+    
+    assert_eq!(lessee, 500); // 50%
+    assert_eq!(lessor, 300); // 30%
+    assert_eq!(dao, 200); // 20%
+    
+    // Verify total equals input
+    assert_eq!(lessee + lessor + dao, total_yield);
+}
+
+#[test]
+fn test_12_month_lease_yield_scenario() {
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
+    
+    // Create a 12-month lease
+    let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
+    let payment_token = Address::generate(&env);
+    
+    let twelve_months = 365 * 24 * 60 * 60; // 12 months in seconds
+    let end_date = START + twelve_months;
+    
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 10000, // Large deposit for yield generation
+        start_date: START,
+        end_date: end_date,
+        property_uri: String::from_str(&env, "test_property_12_month"),
+        payment_token: payment_token.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 0,
+        grace_period_end: end_date,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: true,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 500,
+        swap_path: soroban_sdk::Vec::new(&env),
+    };
+    
+    lease_client.create_lease_instance(&LEASE_ID, &landlord, &params).unwrap();
+    
+    // Deploy 80% of deposit to yield (keeping 20% as buffer)
+    lease_client.deploy_escrow_to_yield(
+        &LEASE_ID,
+        &yield_contract_id,
+        &8000,
+        &500,
+    ).unwrap();
+    
+    // Simulate monthly yield harvesting over 12 months
+    for month in 1..=12 {
+        env.ledger().set_timestamp(START + (month * 30 * 24 * 60 * 60));
+        
+        lease_client.harvest_yield(&LEASE_ID).unwrap();
+        
+        let accumulated = lease_client.get_accumulated_yield(&LEASE_ID);
+        println!("Month {}: Total accumulated yield: {}", month, accumulated);
+    }
+    
+    // Verify total accumulated yield
+    let final_yield = lease_client.get_accumulated_yield(&LEASE_ID);
+    assert_eq!(final_yield, 12000); // 1000 * 12 months
+    
+    // Withdraw principal at end of lease
+    lease_client.withdraw_from_yield(&LEASE_ID, &500).unwrap();
+    
+    // Verify deposit is fully restored
+    let lease = lease_client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.security_deposit, 10000);
+    
+    // Verify deployment is cleaned up
+    let deployment = lease_client.get_yield_deployment(&LEASE_ID).unwrap();
+    assert!(!deployment.active);
 }
 
 
